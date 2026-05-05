@@ -161,3 +161,68 @@ def test_fetch_provider_key_happy_path():
         TableName="chroma-llm-keys",
         Key={"key": {"S": "openrouter"}},
     )
+
+
+def test_fetch_provider_key_returns_none_when_no_item():
+    """No Item in response → return None."""
+    from agent import dynamodb_key_loader
+
+    fake_client = MagicMock()
+    fake_client.get_item.return_value = {}
+
+    result = dynamodb_key_loader._fetch_provider_key(
+        fake_client, "chroma-llm-keys", "openrouter"
+    )
+
+    assert result is None
+
+
+def test_fetch_provider_key_returns_none_when_value_attribute_missing():
+    """Item present but no `value` attribute → return None."""
+    from agent import dynamodb_key_loader
+
+    fake_client = MagicMock()
+    fake_client.get_item.return_value = {
+        "Item": {"key": {"S": "openrouter"}}
+    }
+
+    result = dynamodb_key_loader._fetch_provider_key(
+        fake_client, "chroma-llm-keys", "openrouter"
+    )
+
+    assert result is None
+
+
+def test_fetch_provider_key_returns_none_when_value_string_empty():
+    """`value` present but empty string → return None."""
+    from agent import dynamodb_key_loader
+
+    fake_client = MagicMock()
+    fake_client.get_item.return_value = {
+        "Item": {"key": {"S": "openrouter"}, "value": {"S": ""}}
+    }
+
+    result = dynamodb_key_loader._fetch_provider_key(
+        fake_client, "chroma-llm-keys", "openrouter"
+    )
+
+    assert result is None
+
+
+def test_fetch_provider_key_swallows_client_error(caplog):
+    """Boto ClientError must not propagate; warning is logged."""
+    from agent import dynamodb_key_loader
+
+    fake_client = MagicMock()
+    fake_client.get_item.side_effect = RuntimeError("AccessDeniedException")
+
+    with caplog.at_level("WARNING", logger="agent.dynamodb_key_loader"):
+        result = dynamodb_key_loader._fetch_provider_key(
+            fake_client, "chroma-llm-keys", "openrouter"
+        )
+
+    assert result is None
+    assert any(
+        "GetItem failed for provider=openrouter" in r.message
+        for r in caplog.records
+    )
