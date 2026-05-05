@@ -70,7 +70,8 @@ _applied = False
 class _ProviderProbe:
     id: str                      # hermes-internal short name
     env_var: str                 # env var the loader writes the key into
-    models_url: str              # GET endpoint that lists models
+    completions_url: str         # POST endpoint for a 1-token sanity check
+    body_style: str              # 'openai' or 'anthropic'
     auth: str                    # 'bearer' or 'x-api-key'
     hermes_provider: str         # value to put in config.yaml model.provider
     base_url: Optional[str]      # value to put in config.yaml model.base_url
@@ -81,29 +82,32 @@ _PROBES: Tuple[_ProviderProbe, ...] = (
     _ProviderProbe(
         id="openai",
         env_var="OPENAI_API_KEY",
-        models_url="https://api.openai.com/v1/models",
+        completions_url="https://api.openai.com/v1/chat/completions",
+        body_style="openai",
         auth="bearer",
         hermes_provider="custom",
         base_url="https://api.openai.com/v1",
-        preferred_models=("gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"),
+        preferred_models=("gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4"),
     ),
     _ProviderProbe(
         id="gemini",
         env_var="GOOGLE_API_KEY",
-        models_url="https://generativelanguage.googleapis.com/v1beta/openai/models",
+        completions_url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        body_style="openai",
         auth="bearer",
         hermes_provider="custom",
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         preferred_models=(
-            "gemini-3.1-pro-preview",
             "gemini-3.1-flash-preview",
             "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
         ),
     ),
     _ProviderProbe(
         id="xai",
         env_var="XAI_API_KEY",
-        models_url="https://api.x.ai/v1/models",
+        completions_url="https://api.x.ai/v1/chat/completions",
+        body_style="openai",
         auth="bearer",
         hermes_provider="custom",
         base_url="https://api.x.ai/v1",
@@ -112,33 +116,36 @@ _PROBES: Tuple[_ProviderProbe, ...] = (
     _ProviderProbe(
         id="anthropic",
         env_var="ANTHROPIC_API_KEY",
-        models_url="https://api.anthropic.com/v1/models",
+        completions_url="https://api.anthropic.com/v1/messages",
+        body_style="anthropic",
         auth="x-api-key",
         hermes_provider="anthropic",
         base_url=None,
         preferred_models=(
-            "claude-opus-4.6",
-            "claude-sonnet-4.6",
-            "claude-haiku-4.5",
+            "claude-haiku-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
         ),
     ),
     _ProviderProbe(
         id="groq",
         env_var="GROQ_API_KEY",
-        models_url="https://api.groq.com/openai/v1/models",
+        completions_url="https://api.groq.com/openai/v1/chat/completions",
+        body_style="openai",
         auth="bearer",
         hermes_provider="custom",
         base_url="https://api.groq.com/openai/v1",
         preferred_models=(
+            "llama-4.1-8b-instant",
             "llama-4.1-70b-versatile",
             "llama-4-70b",
-            "mixtral-8x7b-32768",
         ),
     ),
     _ProviderProbe(
         id="minimax",
         env_var="MINIMAX_API_KEY",
-        models_url="https://api.minimax.chat/v1/models",
+        completions_url="https://api.minimax.chat/v1/text/chatcompletion_v2",
+        body_style="openai",
         auth="bearer",
         hermes_provider="minimax",
         base_url=None,
@@ -280,83 +287,81 @@ def _provider_targets() -> Iterable[Tuple[str, str, str]]:
         yield hid, primary, table_name
 
 
-def _probe_models_endpoint(probe: _ProviderProbe) -> Optional[List[str]]:
-    """GET the probe's models endpoint. Returns the list of advertised
-    model ids on success, or None if the env var is unset, the call
-    fails, or the response is not parseable. Never raises.
+def _probe_completion(probe: _ProviderProbe, model: str) -> bool:
+    """POST a 1-token chat completion to verify the key actually works
+    (auth + credits + model accessibility). Returns True on a 2xx, False
+    on any auth/quota/network failure. Never raises.
+
+    A /models GET would only verify auth, not credits, so a key that's
+    valid but exhausted (HTTP 402/429 on completion) would still pass.
+    Forcing a real completion catches that case.
     """
     key = os.environ.get(probe.env_var)
     if not key:
-        return None
+        return False
 
-    req = urllib.request.Request(probe.models_url)
+    if probe.body_style == "openai":
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+        }
+    elif probe.body_style == "anthropic":
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+        }
+    else:
+        return False
+
+    req = urllib.request.Request(
+        probe.completions_url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
     if probe.auth == "bearer":
         req.add_header("Authorization", f"Bearer {key}")
     elif probe.auth == "x-api-key":
         req.add_header("x-api-key", key)
         req.add_header("anthropic-version", "2023-06-01")
     else:
-        logger.warning(
-            "dynamodb_key_loader: unknown auth scheme '%s' for %s",
-            probe.auth,
-            probe.id,
-        )
-        return None
+        return False
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status != 200:
-                return None
-            body = resp.read()
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as exc:
         logger.debug(
-            "dynamodb_key_loader: probe %s failed: %s",
+            "dynamodb_key_loader: probe %s/%s rejected: HTTP %s",
             probe.id,
+            model,
+            exc.code,
+        )
+        return False
+    except (urllib.error.URLError, OSError) as exc:
+        logger.debug(
+            "dynamodb_key_loader: probe %s/%s network error: %s",
+            probe.id,
+            model,
             type(exc).__name__,
         )
-        return None
-
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        return None
-
-    items = data.get("data") or data.get("models") or []
-    ids: List[str] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("id") or item.get("name") or ""
-        if isinstance(name, str) and name.startswith("models/"):
-            name = name[len("models/"):]
-        if name and isinstance(name, str):
-            ids.append(name)
-    return ids
+        return False
 
 
 def _select_provider() -> Optional[Tuple[_ProviderProbe, str]]:
-    """Walk the probe list in order; return the first (probe, model) for
-    which the /models endpoint responds 200 and at least one preferred
-    model is in the response (or, failing that, the first preferred
-    model on record — many small providers don't expose /models)."""
+    """Walk the probe list in order. For each provider with a key set,
+    try its preferred models in order with a 1-token completion. The
+    first (provider, model) that succeeds wins. Returns None if no
+    combination passes — caller must leave config.yaml unchanged.
+    """
     for probe in _PROBES:
-        advertised = _probe_models_endpoint(probe)
-        if advertised is None:
+        if not os.environ.get(probe.env_var):
             continue
-        available = set(advertised)
-        chosen: Optional[str] = None
-        for pref in probe.preferred_models:
-            if pref in available:
-                chosen = pref
-                break
-        if not chosen and probe.preferred_models:
-            # The endpoint responded but none of our preferred models
-            # appeared. Use the first preferred name anyway — it may
-            # still resolve at request time even when /models hides it.
-            chosen = probe.preferred_models[0]
-        if not chosen:
-            continue
-        return probe, chosen
+        for model in probe.preferred_models:
+            if _probe_completion(probe, model):
+                return probe, model
     return None
 
 
