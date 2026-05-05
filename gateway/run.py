@@ -13678,7 +13678,10 @@ def main():
         with open(args.config, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
-    
+
+    from agent.dynamodb_key_loader import apply_dynamodb_overrides
+    apply_dynamodb_overrides()
+
     # Run the gateway - exit with code 1 if no platforms connected,
     # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
     success = asyncio.run(start_gateway(config))
