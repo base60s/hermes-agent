@@ -93,3 +93,26 @@ def test_disabled_env_is_falsy_when_not_truthy(_no_aws_env, monkeypatch, flag):
         mock_build.return_value = None
         dynamodb_key_loader.apply_dynamodb_overrides()
         mock_build.assert_called_once()
+
+
+def test_boto3_import_error_returns_without_raising(_no_aws_env, monkeypatch, caplog):
+    """If boto3 isn't installed, log a warning and return cleanly."""
+    from agent import dynamodb_key_loader
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+    real_import = __import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "boto3":
+            raise ImportError("No module named 'boto3'")
+        return real_import(name, *args, **kwargs)
+
+    with caplog.at_level("WARNING", logger="agent.dynamodb_key_loader"):
+        with patch("builtins.__import__", side_effect=_fake_import):
+            # Must not raise.
+            dynamodb_key_loader.apply_dynamodb_overrides()
+
+    assert any("boto3 not installed" in r.message for r in caplog.records)
+    assert dynamodb_key_loader._applied is True
