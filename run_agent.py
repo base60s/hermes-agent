@@ -13882,6 +13882,9 @@ def main(
     Toolset Examples:
         - "research": Web search, extract, crawl + vision tools
     """
+    from agent.dynamodb_key_loader import apply_dynamodb_overrides
+    apply_dynamodb_overrides()
+
     print("🤖 AI Agent with Tool Calling")
     print("=" * 50)
     
