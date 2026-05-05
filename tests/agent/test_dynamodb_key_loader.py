@@ -17,7 +17,9 @@ def _reset_loader_state():
 
 @pytest.fixture
 def _no_aws_env(monkeypatch):
-    """Strip AWS env vars so tests don't accidentally hit real AWS."""
+    """Strip AWS env vars so tests don't accidentally hit real AWS, and
+    disable the live provider probe so tests never reach api.openai.com
+    or any other live endpoint."""
     for var in (
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
@@ -25,8 +27,10 @@ def _no_aws_env(monkeypatch):
         "AWS_DEFAULT_REGION",
         "HERMES_DYNAMODB_KEY_DISABLED",
         "HERMES_DYNAMODB_KEY_TABLE",
+        "HERMES_MODEL_OVERRIDE",
     ):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HERMES_PROBE_DISABLED", "1")
 
 
 def _scan_response(items, last_key=None):
