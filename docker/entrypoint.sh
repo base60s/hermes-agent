@@ -76,6 +76,36 @@ if [ ! -f "$HERMES_HOME/config.yaml" ]; then
     cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
 fi
 
+# Optional model override from env vars. When set, rewrite the model
+# section of $HERMES_HOME/config.yaml so the gateway picks up the
+# operator-supplied default without the user having to ssh into the
+# container. Idempotent: applies the same values on every container
+# start, so config drift cannot creep in.
+if [ -n "$HERMES_MODEL_OVERRIDE" ]; then
+    HERMES_MODEL_OVERRIDE="$HERMES_MODEL_OVERRIDE" \
+    HERMES_PROVIDER_OVERRIDE="${HERMES_PROVIDER_OVERRIDE:-auto}" \
+    HERMES_BASE_URL_OVERRIDE="${HERMES_BASE_URL_OVERRIDE:-}" \
+    HERMES_CONFIG_PATH="$HERMES_HOME/config.yaml" \
+    python3 - <<'PYEOF'
+import os, yaml
+path = os.environ["HERMES_CONFIG_PATH"]
+with open(path) as f:
+    cfg = yaml.safe_load(f) or {}
+model = cfg.get("model")
+if not isinstance(model, dict):
+    model = {}
+    cfg["model"] = model
+model["default"] = os.environ["HERMES_MODEL_OVERRIDE"]
+model["provider"] = os.environ["HERMES_PROVIDER_OVERRIDE"]
+base_url = os.environ.get("HERMES_BASE_URL_OVERRIDE")
+if base_url:
+    model["base_url"] = base_url
+with open(path, "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False)
+print(f"entrypoint: applied model override → {model['default']} (provider={model['provider']}, base_url={model.get('base_url','-')})")
+PYEOF
+fi
+
 # SOUL.md
 if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
     cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
