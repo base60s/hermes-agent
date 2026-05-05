@@ -287,34 +287,25 @@ def _provider_targets() -> Iterable[Tuple[str, str, str]]:
         yield hid, primary, table_name
 
 
-def _probe_completion(probe: _ProviderProbe, model: str) -> bool:
-    """POST a 1-token chat completion to verify the key actually works
-    (auth + credits + model accessibility). Returns True on a 2xx, False
-    on any auth/quota/network failure. Never raises.
+def _probe_completion_with_key(
+    probe: _ProviderProbe, model: str, key: str
+) -> bool:
+    """POST a 1-token chat completion using a specific key. Returns True
+    on 2xx, False on any auth/quota/network failure. Never raises.
 
-    A /models GET would only verify auth, not credits, so a key that's
-    valid but exhausted (HTTP 402/429 on completion) would still pass.
-    Forcing a real completion catches that case.
+    Auth-only checks (e.g. GET /models) miss the common pool failure
+    modes — flagged-as-leaked, expired, free-tier daily quota burned —
+    so the probe forces a real completion against the model the bot
+    would actually use.
     """
-    key = os.environ.get(probe.env_var)
     if not key:
         return False
 
-    if probe.body_style == "openai":
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 1,
-        }
-    elif probe.body_style == "anthropic":
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 1,
-        }
-    else:
-        return False
-
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    }
     req = urllib.request.Request(
         probe.completions_url,
         data=json.dumps(body).encode("utf-8"),
@@ -334,34 +325,54 @@ def _probe_completion(probe: _ProviderProbe, model: str) -> bool:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
         logger.debug(
-            "dynamodb_key_loader: probe %s/%s rejected: HTTP %s",
+            "dynamodb_key_loader: probe %s/%s rejected (key=%s…): HTTP %s",
             probe.id,
             model,
+            key[:6],
             exc.code,
         )
         return False
     except (urllib.error.URLError, OSError) as exc:
         logger.debug(
-            "dynamodb_key_loader: probe %s/%s network error: %s",
+            "dynamodb_key_loader: probe %s/%s network error (key=%s…): %s",
             probe.id,
             model,
+            key[:6],
             type(exc).__name__,
         )
         return False
 
 
-def _select_provider() -> Optional[Tuple[_ProviderProbe, str]]:
-    """Walk the probe list in order. For each provider with a key set,
-    try its preferred models in order with a 1-token completion. The
-    first (provider, model) that succeeds wins. Returns None if no
-    combination passes — caller must leave config.yaml unchanged.
+def _provider_table_name_for(hermes_id: str) -> str:
+    """Return the table's capitalized provider value for a Hermes id."""
+    for hid, _, table_name in _EXTRA_TARGETS:
+        if hid == hermes_id:
+            return table_name
+    return _TABLE_PROVIDER_NAMES.get(hermes_id, hermes_id)
+
+
+def _select_provider_and_key(
+    keys_by_provider: Dict[str, List[str]]
+) -> Optional[Tuple[_ProviderProbe, str, str]]:
+    """Walk the probe list in priority order. For each provider, try
+    every available key × every preferred model until one (key, model)
+    returns 2xx. Returns ``(probe, model, working_key)`` or None.
+
+    Trying every key per provider matters because pool keys are
+    frequently flagged, expired, or quota-burned even when their
+    DynamoDB ``validation_status`` is still ``"valid"`` (validation is
+    set at first-seen time and decays). Only when every key for a
+    provider fails do we move to the next provider in the priority
+    chain.
     """
     for probe in _PROBES:
-        if not os.environ.get(probe.env_var):
+        candidates = keys_by_provider.get(_provider_table_name_for(probe.id))
+        if not candidates:
             continue
-        for model in probe.preferred_models:
-            if _probe_completion(probe, model):
-                return probe, model
+        for key in candidates:
+            for model in probe.preferred_models:
+                if _probe_completion_with_key(probe, model, key):
+                    return probe, model, key
     return None
 
 
@@ -477,23 +488,29 @@ def apply_dynamodb_overrides() -> None:
     # before any logging handler is configured.
     print(summary, file=sys.stderr, flush=True)
 
-    # Dynamic provider selection. Walk _PROBES in priority order and
-    # write the first working provider's choice into config.yaml so the
-    # gateway always has a model that can answer. Skipped when the
-    # operator has pinned a model via entrypoint's HERMES_MODEL_OVERRIDE
-    # block, or via the explicit HERMES_PROBE_DISABLED escape hatch.
+    # Dynamic provider selection. Walk _PROBES in priority order; for
+    # each provider, try every available key × every preferred model
+    # until one (key, model) returns 2xx on a real 1-token completion.
+    # The working key replaces whatever the loader wrote earlier into
+    # the provider's env var (so the bot uses the verified key, not
+    # just any 'valid' one), and the model is patched into config.yaml.
+    # Skipped when HERMES_MODEL_OVERRIDE pins a choice, or
+    # HERMES_PROBE_DISABLED is truthy.
     if (
         not _is_truthy(os.environ.get("HERMES_PROBE_DISABLED"))
         and not os.environ.get("HERMES_MODEL_OVERRIDE")
     ):
-        selection = _select_provider()
+        selection = _select_provider_and_key(keys_by_provider)
         if selection is not None:
-            probe, model = selection
+            probe, model, working_key = selection
+            os.environ[probe.env_var] = working_key
             _write_config_overrides(probe, model)
         else:
             no_provider_msg = (
-                "dynamodb_key_loader: no provider responded successfully "
-                "to /models probes; leaving config.yaml unchanged"
+                "dynamodb_key_loader: no (provider, key, model) combination "
+                "returned 2xx on a 1-token completion; leaving config.yaml "
+                "unchanged — the bot will fall back to whatever the existing "
+                "config and env vars allow"
             )
             logger.warning(no_provider_msg)
             print(no_provider_msg, file=sys.stderr, flush=True)
