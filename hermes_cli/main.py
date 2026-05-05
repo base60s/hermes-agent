@@ -8043,6 +8043,9 @@ def cmd_logs(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    from agent.dynamodb_key_loader import apply_dynamodb_overrides
+    apply_dynamodb_overrides()
+
     from hermes_cli._parser import build_top_level_parser
 
     parser, subparsers, chat_parser = build_top_level_parser()
