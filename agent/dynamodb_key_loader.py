@@ -176,5 +176,22 @@ def apply_dynamodb_overrides() -> None:
         _applied = True
         return
 
-    # Per-provider GetItem and write-into-os.environ wired up in Task 7.
+    table = os.environ.get("HERMES_DYNAMODB_KEY_TABLE") or DEFAULT_TABLE
+
+    applied_count = 0
+    total_count = 0
+    for provider_id, primary_env_var in _provider_targets():
+        total_count += 1
+        value = _fetch_provider_key(client, table, provider_id)
+        if value is None:
+            continue
+        os.environ[primary_env_var] = value
+        applied_count += 1
+
+    logger.info(
+        "dynamodb_key_loader: applied %d/%d provider keys from %s",
+        applied_count,
+        total_count,
+        table,
+    )
     _applied = True

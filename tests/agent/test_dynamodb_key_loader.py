@@ -226,3 +226,116 @@ def test_fetch_provider_key_swallows_client_error(caplog):
         "GetItem failed for provider=openrouter" in r.message
         for r in caplog.records
     )
+
+
+def test_apply_overrides_writes_env_var_for_present_row(
+    _no_aws_env, monkeypatch
+):
+    """A present DynamoDB row overwrites the corresponding env var."""
+    from agent import dynamodb_key_loader
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "stale-env-value")
+
+    fake_client = MagicMock()
+
+    def _get_item(TableName, Key):
+        if Key == {"key": {"S": "openrouter"}}:
+            return {
+                "Item": {
+                    "key": {"S": "openrouter"},
+                    "value": {"S": "sk-or-fresh"},
+                }
+            }
+        return {}
+
+    fake_client.get_item.side_effect = _get_item
+
+    with patch.object(
+        dynamodb_key_loader, "_build_client", return_value=fake_client
+    ):
+        dynamodb_key_loader.apply_dynamodb_overrides()
+
+    assert os.environ["OPENROUTER_API_KEY"] == "sk-or-fresh"
+
+
+def test_apply_overrides_preserves_env_var_when_row_absent(
+    _no_aws_env, monkeypatch
+):
+    """Absent rows leave existing env vars untouched."""
+    from agent import dynamodb_key_loader
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "preserved-env-value")
+
+    fake_client = MagicMock()
+    fake_client.get_item.return_value = {}  # nothing in the table
+
+    with patch.object(
+        dynamodb_key_loader, "_build_client", return_value=fake_client
+    ):
+        dynamodb_key_loader.apply_dynamodb_overrides()
+
+    assert os.environ["OPENROUTER_API_KEY"] == "preserved-env-value"
+
+
+def test_apply_overrides_partial_failure_does_not_block_other_providers(
+    _no_aws_env, monkeypatch
+):
+    """One provider's GetItem error must not prevent others from being applied."""
+    from agent import dynamodb_key_loader
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    fake_client = MagicMock()
+
+    def _get_item(TableName, Key):
+        provider = Key["key"]["S"]
+        if provider == "openrouter":
+            raise RuntimeError("AccessDeniedException")
+        if provider == "anthropic":
+            return {
+                "Item": {
+                    "key": {"S": "anthropic"},
+                    "value": {"S": "sk-ant-fresh"},
+                }
+            }
+        return {}
+
+    fake_client.get_item.side_effect = _get_item
+
+    with patch.object(
+        dynamodb_key_loader, "_build_client", return_value=fake_client
+    ):
+        dynamodb_key_loader.apply_dynamodb_overrides()
+
+    assert "OPENROUTER_API_KEY" not in os.environ
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-fresh"
+
+
+def test_apply_overrides_uses_custom_table_name(_no_aws_env, monkeypatch):
+    """HERMES_DYNAMODB_KEY_TABLE overrides the default table name."""
+    from agent import dynamodb_key_loader
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("HERMES_DYNAMODB_KEY_TABLE", "staging-llm-keys")
+
+    fake_client = MagicMock()
+    fake_client.get_item.return_value = {}
+
+    with patch.object(
+        dynamodb_key_loader, "_build_client", return_value=fake_client
+    ):
+        dynamodb_key_loader.apply_dynamodb_overrides()
+
+    # At least one call must have used the override table name.
+    seen_tables = {
+        call.kwargs.get("TableName") for call in fake_client.get_item.call_args_list
+    }
+    assert seen_tables == {"staging-llm-keys"}
