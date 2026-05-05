@@ -29,6 +29,18 @@ def _no_aws_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+def _scan_response(items, last_key=None):
+    """Helper: build a Scan response with the given items and pagination cursor."""
+    out = {"Items": items}
+    if last_key is not None:
+        out["LastEvaluatedKey"] = last_key
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Skip / gating
+# ---------------------------------------------------------------------------
+
 def test_idempotent_skip_when_already_applied(_no_aws_env, monkeypatch):
     """Second call is a no-op even if env changes between calls."""
     from agent import dynamodb_key_loader
@@ -88,8 +100,6 @@ def test_disabled_env_is_falsy_when_not_truthy(_no_aws_env, monkeypatch, flag):
     monkeypatch.setenv("HERMES_DYNAMODB_KEY_DISABLED", flag)
 
     with patch.object(dynamodb_key_loader, "_build_client") as mock_build:
-        # _build_client is mocked to return None so the loader exits early
-        # but it should still be *called* — that's what we're asserting.
         mock_build.return_value = None
         dynamodb_key_loader.apply_dynamodb_overrides()
         mock_build.assert_called_once()
@@ -111,211 +121,214 @@ def test_boto3_import_error_returns_without_raising(_no_aws_env, monkeypatch, ca
 
     with caplog.at_level("WARNING", logger="agent.dynamodb_key_loader"):
         with patch("builtins.__import__", side_effect=_fake_import):
-            # Must not raise.
             dynamodb_key_loader.apply_dynamodb_overrides()
 
     assert any("boto3 not installed" in r.message for r in caplog.records)
     assert dynamodb_key_loader._applied is True
 
 
-def test_provider_targets_yields_id_and_primary_env_var():
-    """_provider_targets yields (provider_id, primary_env_var) for providers
-    that have at least one api_key_env_var, lowercasing the provider id."""
+# ---------------------------------------------------------------------------
+# _provider_targets
+# ---------------------------------------------------------------------------
+
+def test_provider_targets_yields_id_env_var_and_table_name():
+    """_provider_targets yields (hermes_id, primary_env_var, table_provider_name)
+    for every provider whose key we want to source from DynamoDB."""
     from agent import dynamodb_key_loader
 
-    targets = dict(dynamodb_key_loader._provider_targets())
+    targets = list(dynamodb_key_loader._provider_targets())
+    by_id = {hid: (env, tname) for (hid, env, tname) in targets}
 
-    # OpenRouter must be present and map to OPENROUTER_API_KEY.
-    assert "openrouter" in targets
-    assert targets["openrouter"] == "OPENROUTER_API_KEY"
+    # _EXTRA_TARGETS entries
+    assert by_id["openrouter"] == ("OPENROUTER_API_KEY", "OpenRouter")
+    assert by_id["groq"] == ("GROQ_API_KEY", "Groq")
+    assert by_id["openai"] == ("OPENAI_API_KEY", "OpenAI")
 
-    # Anthropic must be present and pick the *first* env var alias.
-    assert "anthropic" in targets
-    assert targets["anthropic"] == "ANTHROPIC_API_KEY"
+    # _TABLE_PROVIDER_NAMES entries that exist in the registry
+    assert by_id["anthropic"] == ("ANTHROPIC_API_KEY", "Anthropic")
+    assert by_id["xai"] == ("XAI_API_KEY", "xAI")
+    assert by_id["minimax"] == ("MINIMAX_API_KEY", "Minimax")
 
-    # All keys are lowercase, all values are non-empty strings.
-    for provider_id, env_var in targets.items():
-        assert provider_id == provider_id.lower(), provider_id
-        assert env_var and isinstance(env_var, str), (provider_id, env_var)
+    # gemini's primary env var is GOOGLE_API_KEY (Hermes's first alias)
+    assert by_id["gemini"] == ("GOOGLE_API_KEY", "Gemini")
 
 
-def test_fetch_provider_key_happy_path():
-    """_fetch_provider_key returns the value when GetItem returns an Item
-    with a non-empty `value` string attribute."""
+def test_provider_targets_does_not_duplicate():
+    """If a hermes id appears in both _EXTRA_TARGETS and the registry, it
+    is yielded only once (the _EXTRA_TARGETS entry wins)."""
+    from agent import dynamodb_key_loader
+
+    ids = [hid for (hid, _, _) in dynamodb_key_loader._provider_targets()]
+    assert len(ids) == len(set(ids))
+
+
+# ---------------------------------------------------------------------------
+# _scan_valid_keys_by_provider
+# ---------------------------------------------------------------------------
+
+def test_scan_groups_valid_keys_by_provider():
+    """Single-page Scan groups keys by provider, dropping non-valid rows."""
     from agent import dynamodb_key_loader
 
     fake_client = MagicMock()
-    fake_client.get_item.return_value = {
-        "Item": {
-            "key": {"S": "openrouter"},
-            "value": {"S": "sk-or-v1-test"},
-        }
+    fake_client.scan.return_value = _scan_response([
+        {"key": {"S": "k1"}, "provider": {"S": "Anthropic"},
+         "validation_status": {"S": "valid"}},
+        {"key": {"S": "k2"}, "provider": {"S": "Anthropic"},
+         "validation_status": {"S": "valid"}},
+        {"key": {"S": "k3"}, "provider": {"S": "Gemini"},
+         "validation_status": {"S": "valid"}},
+        {"key": {"S": "k4"}, "provider": {"S": "Gemini"},
+         "validation_status": {"S": "invalid"}},
+        # Missing provider — skipped
+        {"key": {"S": "k5"}, "validation_status": {"S": "valid"}},
+        # Missing key — skipped
+        {"provider": {"S": "OpenAI"}, "validation_status": {"S": "valid"}},
+    ])
+
+    out = dynamodb_key_loader._scan_valid_keys_by_provider(
+        fake_client, "chroma-llm-keys"
+    )
+    assert out == {
+        "Anthropic": ["k1", "k2"],
+        "Gemini": ["k3"],
     }
-
-    result = dynamodb_key_loader._fetch_provider_key(
-        fake_client, "chroma-llm-keys", "openrouter"
-    )
-
-    assert result == "sk-or-v1-test"
-    fake_client.get_item.assert_called_once_with(
-        TableName="chroma-llm-keys",
-        Key={"key": {"S": "openrouter"}},
-    )
+    fake_client.scan.assert_called_once()
 
 
-def test_fetch_provider_key_returns_none_when_no_item():
-    """No Item in response → return None."""
+def test_scan_paginates_through_last_evaluated_key():
+    """Scan continues while LastEvaluatedKey is present."""
     from agent import dynamodb_key_loader
 
     fake_client = MagicMock()
-    fake_client.get_item.return_value = {}
+    fake_client.scan.side_effect = [
+        _scan_response(
+            [
+                {"key": {"S": "k1"}, "provider": {"S": "Anthropic"},
+                 "validation_status": {"S": "valid"}},
+            ],
+            last_key={"key": {"S": "k1"}},
+        ),
+        _scan_response(
+            [
+                {"key": {"S": "k2"}, "provider": {"S": "Gemini"},
+                 "validation_status": {"S": "valid"}},
+            ],
+        ),  # no LastEvaluatedKey → terminates
+    ]
 
-    result = dynamodb_key_loader._fetch_provider_key(
-        fake_client, "chroma-llm-keys", "openrouter"
+    out = dynamodb_key_loader._scan_valid_keys_by_provider(
+        fake_client, "chroma-llm-keys"
     )
+    assert out == {"Anthropic": ["k1"], "Gemini": ["k2"]}
+    assert fake_client.scan.call_count == 2
 
-    assert result is None
+    # Second call must have passed the cursor.
+    second_call_kwargs = fake_client.scan.call_args_list[1].kwargs
+    assert second_call_kwargs.get("ExclusiveStartKey") == {"key": {"S": "k1"}}
 
 
-def test_fetch_provider_key_returns_none_when_value_attribute_missing():
-    """Item present but no `value` attribute → return None."""
+def test_scan_swallows_aws_error_and_returns_partial(caplog):
+    """A Scan error mid-pagination logs a warning and returns what was
+    accumulated so far. The caller never sees an exception."""
     from agent import dynamodb_key_loader
 
     fake_client = MagicMock()
-    fake_client.get_item.return_value = {
-        "Item": {"key": {"S": "openrouter"}}
-    }
-
-    result = dynamodb_key_loader._fetch_provider_key(
-        fake_client, "chroma-llm-keys", "openrouter"
-    )
-
-    assert result is None
-
-
-def test_fetch_provider_key_returns_none_when_value_string_empty():
-    """`value` present but empty string → return None."""
-    from agent import dynamodb_key_loader
-
-    fake_client = MagicMock()
-    fake_client.get_item.return_value = {
-        "Item": {"key": {"S": "openrouter"}, "value": {"S": ""}}
-    }
-
-    result = dynamodb_key_loader._fetch_provider_key(
-        fake_client, "chroma-llm-keys", "openrouter"
-    )
-
-    assert result is None
-
-
-def test_fetch_provider_key_swallows_client_error(caplog):
-    """Boto ClientError must not propagate; warning is logged."""
-    from agent import dynamodb_key_loader
-
-    fake_client = MagicMock()
-    fake_client.get_item.side_effect = RuntimeError("AccessDeniedException")
+    fake_client.scan.side_effect = [
+        _scan_response(
+            [
+                {"key": {"S": "k1"}, "provider": {"S": "Anthropic"},
+                 "validation_status": {"S": "valid"}},
+            ],
+            last_key={"key": {"S": "k1"}},
+        ),
+        RuntimeError("Throttled"),
+    ]
 
     with caplog.at_level("WARNING", logger="agent.dynamodb_key_loader"):
-        result = dynamodb_key_loader._fetch_provider_key(
-            fake_client, "chroma-llm-keys", "openrouter"
+        out = dynamodb_key_loader._scan_valid_keys_by_provider(
+            fake_client, "chroma-llm-keys"
         )
 
-    assert result is None
-    assert any(
-        "GetItem failed for provider=openrouter" in r.message
-        for r in caplog.records
-    )
+    assert out == {"Anthropic": ["k1"]}
+    assert any("Scan failed" in r.message for r in caplog.records)
 
 
-def test_apply_overrides_writes_env_var_for_present_row(
-    _no_aws_env, monkeypatch
-):
-    """A present DynamoDB row overwrites the corresponding env var."""
+# ---------------------------------------------------------------------------
+# apply_dynamodb_overrides — integration with the scan
+# ---------------------------------------------------------------------------
+
+def test_apply_overrides_writes_env_var_for_each_provider(_no_aws_env, monkeypatch):
+    """Rows for Anthropic and Gemini cause their env vars to be written
+    with the first valid key returned."""
     from agent import dynamodb_key_loader
 
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "stale-env-value")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-anthropic")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
 
     fake_client = MagicMock()
-
-    def _get_item(TableName, Key):
-        if Key == {"key": {"S": "openrouter"}}:
-            return {
-                "Item": {
-                    "key": {"S": "openrouter"},
-                    "value": {"S": "sk-or-fresh"},
-                }
-            }
-        return {}
-
-    fake_client.get_item.side_effect = _get_item
+    fake_client.scan.return_value = _scan_response([
+        {"key": {"S": "sk-ant-fresh"}, "provider": {"S": "Anthropic"},
+         "validation_status": {"S": "valid"}},
+        {"key": {"S": "AIza-fresh"}, "provider": {"S": "Gemini"},
+         "validation_status": {"S": "valid"}},
+    ])
 
     with patch.object(
         dynamodb_key_loader, "_build_client", return_value=fake_client
     ):
         dynamodb_key_loader.apply_dynamodb_overrides()
 
-    assert os.environ["OPENROUTER_API_KEY"] == "sk-or-fresh"
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-fresh"
+    assert os.environ["GOOGLE_API_KEY"] == "AIza-fresh"
 
 
-def test_apply_overrides_preserves_env_var_when_row_absent(
-    _no_aws_env, monkeypatch
-):
-    """Absent rows leave existing env vars untouched."""
+def test_apply_overrides_preserves_env_var_when_provider_absent(_no_aws_env, monkeypatch):
+    """No row for a provider → env var untouched (DynamoDB does not win
+    when there is nothing to win with)."""
     from agent import dynamodb_key_loader
 
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "preserved-env-value")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "preserved")
 
     fake_client = MagicMock()
-    fake_client.get_item.return_value = {}  # nothing in the table
+    fake_client.scan.return_value = _scan_response([])
 
     with patch.object(
         dynamodb_key_loader, "_build_client", return_value=fake_client
     ):
         dynamodb_key_loader.apply_dynamodb_overrides()
 
-    assert os.environ["OPENROUTER_API_KEY"] == "preserved-env-value"
+    assert os.environ["OPENROUTER_API_KEY"] == "preserved"
 
 
-def test_apply_overrides_partial_failure_does_not_block_other_providers(
-    _no_aws_env, monkeypatch
-):
-    """One provider's GetItem error must not prevent others from being applied."""
+def test_apply_overrides_uses_first_key_when_multiple_present(_no_aws_env, monkeypatch):
+    """When multiple valid keys exist for a provider, the first one
+    encountered during the scan wins."""
     from agent import dynamodb_key_loader
 
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
     fake_client = MagicMock()
-
-    def _get_item(TableName, Key):
-        provider = Key["key"]["S"]
-        if provider == "openrouter":
-            raise RuntimeError("AccessDeniedException")
-        if provider == "anthropic":
-            return {
-                "Item": {
-                    "key": {"S": "anthropic"},
-                    "value": {"S": "sk-ant-fresh"},
-                }
-            }
-        return {}
-
-    fake_client.get_item.side_effect = _get_item
+    fake_client.scan.return_value = _scan_response([
+        {"key": {"S": "first"}, "provider": {"S": "Anthropic"},
+         "validation_status": {"S": "valid"}},
+        {"key": {"S": "second"}, "provider": {"S": "Anthropic"},
+         "validation_status": {"S": "valid"}},
+    ])
 
     with patch.object(
         dynamodb_key_loader, "_build_client", return_value=fake_client
     ):
         dynamodb_key_loader.apply_dynamodb_overrides()
 
-    assert "OPENROUTER_API_KEY" not in os.environ
-    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-fresh"
+    assert os.environ["ANTHROPIC_API_KEY"] == "first"
 
 
 def test_apply_overrides_uses_custom_table_name(_no_aws_env, monkeypatch):
@@ -327,15 +340,37 @@ def test_apply_overrides_uses_custom_table_name(_no_aws_env, monkeypatch):
     monkeypatch.setenv("HERMES_DYNAMODB_KEY_TABLE", "staging-llm-keys")
 
     fake_client = MagicMock()
-    fake_client.get_item.return_value = {}
+    fake_client.scan.return_value = _scan_response([])
 
     with patch.object(
         dynamodb_key_loader, "_build_client", return_value=fake_client
     ):
         dynamodb_key_loader.apply_dynamodb_overrides()
 
-    # At least one call must have used the override table name.
     seen_tables = {
-        call.kwargs.get("TableName") for call in fake_client.get_item.call_args_list
+        call.kwargs.get("TableName") for call in fake_client.scan.call_args_list
     }
     assert seen_tables == {"staging-llm-keys"}
+
+
+def test_apply_overrides_logs_summary_to_stderr(_no_aws_env, monkeypatch, capsys):
+    """The summary line is printed to stderr regardless of logging config."""
+    from agent import dynamodb_key_loader
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+    fake_client = MagicMock()
+    fake_client.scan.return_value = _scan_response([
+        {"key": {"S": "sk-ant"}, "provider": {"S": "Anthropic"},
+         "validation_status": {"S": "valid"}},
+    ])
+
+    with patch.object(
+        dynamodb_key_loader, "_build_client", return_value=fake_client
+    ):
+        dynamodb_key_loader.apply_dynamodb_overrides()
+
+    captured = capsys.readouterr()
+    assert "dynamodb_key_loader: applied" in captured.err
+    assert "from chroma-llm-keys" in captured.err

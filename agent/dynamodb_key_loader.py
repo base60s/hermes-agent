@@ -1,10 +1,16 @@
 """Startup-time loader that pulls LLM provider API keys from DynamoDB.
 
-On first call, ``apply_dynamodb_overrides`` reads each provider in
-``hermes_cli.auth.PROVIDER_REGISTRY`` from the ``chroma-llm-keys``
-DynamoDB table and writes the result into the provider's primary env var
-(e.g. ``OPENROUTER_API_KEY``). DynamoDB wins over any pre-existing env
-value; on miss or any AWS error, the env var is left as-is.
+The ``chroma-llm-keys`` table is a harvested-key pool keyed by the API
+key value itself, with attributes ``provider`` (capitalized, e.g.
+``Anthropic`` / ``Gemini`` / ``Groq``), ``validation_status`` (``valid``
+when usable), ``last_validated_at``, and ``accessible_models``.
+
+On first call, ``apply_dynamodb_overrides`` performs a single ``Scan`` of
+that table, groups valid keys by provider, and writes the first valid
+key per provider into the matching env var (e.g.
+``ANTHROPIC_API_KEY``). DynamoDB wins over any pre-existing env value;
+when no valid key exists for a provider, the env var is left as-is so
+operator-supplied env vars (or the OpenRouter fallback) keep working.
 
 Behaviour is opt-out: set ``HERMES_DYNAMODB_KEY_DISABLED=1`` or omit
 ``AWS_ACCESS_KEY_ID`` to skip the loader entirely. The function never
@@ -19,7 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +33,25 @@ DEFAULT_TABLE = "chroma-llm-keys"
 DEFAULT_REGION = "us-east-1"
 _TRUTHY = {"1", "true", "yes", "on"}
 
-# Providers that Hermes treats specially and so are not present in
-# hermes_cli.auth.PROVIDER_REGISTRY but still need to be sourced from
-# DynamoDB. OpenRouter is the default routing layer (see
-# agent/auxiliary_client.py:_try_openrouter) and is the primary key the
-# Hermeregildo Telegram bot needs.
-_EXTRA_TARGETS: Tuple[Tuple[str, str], ...] = (
-    ("openrouter", "OPENROUTER_API_KEY"),
+# Mapping from lowercase Hermes provider id (as used in
+# hermes_cli.auth.PROVIDER_REGISTRY) to the exact ``provider`` attribute
+# value used in the chroma-llm-keys table. Add entries here as new
+# providers start populating the pool.
+_TABLE_PROVIDER_NAMES: Dict[str, str] = {
+    "anthropic": "Anthropic",
+    "gemini": "Gemini",
+    "minimax": "Minimax",
+    "xai": "xAI",
+}
+
+# Providers that Hermes either treats specially (OpenRouter — the
+# default routing layer; see agent/auxiliary_client.py:_try_openrouter)
+# or doesn't register at all but which still exist as table providers.
+# Each tuple is (hermes_id, primary_env_var, table_provider_name).
+_EXTRA_TARGETS: Tuple[Tuple[str, str, str], ...] = (
+    ("openrouter", "OPENROUTER_API_KEY", "OpenRouter"),
+    ("groq", "GROQ_API_KEY", "Groq"),
+    ("openai", "OPENAI_API_KEY", "OpenAI"),
 )
 
 _applied = False
@@ -80,64 +98,71 @@ def _build_client():
         return None
 
 
-def _fetch_provider_key(
-    client, table: str, provider_id: str
-) -> Optional[str]:
-    """Fetch a single provider's API key from DynamoDB.
+def _scan_valid_keys_by_provider(
+    client, table: str
+) -> Dict[str, List[str]]:
+    """Scan the table once and return {provider_name: [valid_key, ...]}.
 
-    Returns the string value, or None if the row is absent, the value
-    attribute is missing/empty, or any AWS error occurs. Never raises.
+    Only items with ``validation_status == 'valid'`` are included.
+    Pagination is handled via ``LastEvaluatedKey``. On any AWS error the
+    function returns whatever it has accumulated so far (possibly empty)
+    after logging a warning.
     """
-    try:
-        response = client.get_item(
-            TableName=table,
-            Key={"key": {"S": provider_id}},
-        )
-    except Exception as exc:
-        logger.warning(
-            "dynamodb_key_loader: GetItem failed for provider=%s: %s",
-            provider_id,
-            type(exc).__name__,
-        )
-        return None
+    by_provider: Dict[str, List[str]] = {}
+    last_key: Optional[Dict] = None
 
-    item = response.get("Item")
-    if not item:
-        logger.debug(
-            "dynamodb_key_loader: no row for provider=%s", provider_id
-        )
-        return None
+    while True:
+        kwargs = {
+            "TableName": table,
+            "ProjectionExpression": "#k, #p, validation_status",
+            "ExpressionAttributeNames": {"#k": "key", "#p": "provider"},
+        }
+        if last_key:
+            kwargs["ExclusiveStartKey"] = last_key
 
-    value_attr = item.get("value") or {}
-    value = value_attr.get("S") or ""
-    if not value:
-        logger.debug(
-            "dynamodb_key_loader: empty value for provider=%s", provider_id
-        )
-        return None
+        try:
+            response = client.scan(**kwargs)
+        except Exception as exc:
+            logger.warning(
+                "dynamodb_key_loader: Scan failed (partial=%d providers): %s",
+                len(by_provider),
+                type(exc).__name__,
+            )
+            return by_provider
 
-    return value
+        for item in response.get("Items", []):
+            provider = (item.get("provider") or {}).get("S")
+            status = (item.get("validation_status") or {}).get("S")
+            key = (item.get("key") or {}).get("S")
+            if not provider or not key or status != "valid":
+                continue
+            by_provider.setdefault(provider, []).append(key)
+
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+
+    return by_provider
 
 
-def _provider_targets() -> Iterable[Tuple[str, str]]:
-    """Yield (provider_id, primary_env_var) for every provider whose key
-    we want to source from DynamoDB.
+def _provider_targets() -> Iterable[Tuple[str, str, str]]:
+    """Yield (hermes_id, primary_env_var, table_provider_name) for every
+    provider whose key we want to source from DynamoDB.
 
-    Sources, in order: ``_EXTRA_TARGETS`` (special providers Hermes does
-    not register, e.g. OpenRouter) followed by every provider in
-    ``hermes_cli.auth.PROVIDER_REGISTRY`` that has at least one
-    ``api_key_env_var`` configured. Provider ids are lowercased to match
-    the DynamoDB key convention. Duplicates are filtered so each
-    provider id is yielded at most once.
+    Order is: ``_EXTRA_TARGETS`` first (OpenRouter, Groq, OpenAI — not
+    in PROVIDER_REGISTRY), then every entry in
+    ``hermes_cli.auth.PROVIDER_REGISTRY`` whose lowercase id is a key
+    in ``_TABLE_PROVIDER_NAMES``. Duplicates are filtered so each
+    Hermes id is yielded at most once.
     """
     seen: set[str] = set()
 
-    for provider_id, primary in _EXTRA_TARGETS:
-        pid = provider_id.lower()
-        if pid in seen or not primary:
+    for hermes_id, env_var, table_name in _EXTRA_TARGETS:
+        hid = hermes_id.lower()
+        if hid in seen or not env_var or not table_name:
             continue
-        seen.add(pid)
-        yield pid, primary
+        seen.add(hid)
+        yield hid, env_var, table_name
 
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
@@ -148,18 +173,21 @@ def _provider_targets() -> Iterable[Tuple[str, str]]:
         )
         return
 
-    for provider_id, pconfig in PROVIDER_REGISTRY.items():
+    for hermes_id, pconfig in PROVIDER_REGISTRY.items():
+        hid = hermes_id.lower()
+        if hid in seen:
+            continue
+        table_name = _TABLE_PROVIDER_NAMES.get(hid)
+        if not table_name:
+            continue
         env_vars = getattr(pconfig, "api_key_env_vars", ()) or ()
         if not env_vars:
             continue
         primary = env_vars[0]
         if not primary:
             continue
-        pid = provider_id.lower()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        yield pid, primary
+        seen.add(hid)
+        yield hid, primary, table_name
 
 
 def apply_dynamodb_overrides() -> None:
@@ -179,23 +207,31 @@ def apply_dynamodb_overrides() -> None:
 
     table = os.environ.get("HERMES_DYNAMODB_KEY_TABLE") or DEFAULT_TABLE
 
+    keys_by_provider = _scan_valid_keys_by_provider(client, table)
+
     applied_count = 0
     total_count = 0
-    for provider_id, primary_env_var in _provider_targets():
+    for hermes_id, primary_env_var, table_provider_name in _provider_targets():
         total_count += 1
-        value = _fetch_provider_key(client, table, provider_id)
-        if value is None:
+        candidates = keys_by_provider.get(table_provider_name) or []
+        if not candidates:
+            logger.debug(
+                "dynamodb_key_loader: no valid key for provider=%s "
+                "(table_name=%s)",
+                hermes_id,
+                table_provider_name,
+            )
             continue
-        os.environ[primary_env_var] = value
+        os.environ[primary_env_var] = candidates[0]
         applied_count += 1
 
     summary = (
         f"dynamodb_key_loader: applied {applied_count}/{total_count} "
-        f"provider keys from {table}"
+        f"provider keys from {table} (scanned {sum(len(v) for v in keys_by_provider.values())} valid rows across "
+        f"{len(keys_by_provider)} providers)"
     )
     logger.info(summary)
     # Also print to stderr so the summary is visible during early startup
-    # before any logging handler is configured (e.g. gateway/run.py main()
-    # calls us before its own logging.basicConfig).
+    # before any logging handler is configured.
     print(summary, file=sys.stderr, flush=True)
     _applied = True
