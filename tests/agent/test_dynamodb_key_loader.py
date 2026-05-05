@@ -137,3 +137,27 @@ def test_provider_targets_yields_id_and_primary_env_var():
     for provider_id, env_var in targets.items():
         assert provider_id == provider_id.lower(), provider_id
         assert env_var and isinstance(env_var, str), (provider_id, env_var)
+
+
+def test_fetch_provider_key_happy_path():
+    """_fetch_provider_key returns the value when GetItem returns an Item
+    with a non-empty `value` string attribute."""
+    from agent import dynamodb_key_loader
+
+    fake_client = MagicMock()
+    fake_client.get_item.return_value = {
+        "Item": {
+            "key": {"S": "openrouter"},
+            "value": {"S": "sk-or-v1-test"},
+        }
+    }
+
+    result = dynamodb_key_loader._fetch_provider_key(
+        fake_client, "chroma-llm-keys", "openrouter"
+    )
+
+    assert result == "sk-or-v1-test"
+    fake_client.get_item.assert_called_once_with(
+        TableName="chroma-llm-keys",
+        Key={"key": {"S": "openrouter"}},
+    )

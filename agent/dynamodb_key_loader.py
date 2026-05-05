@@ -79,6 +79,45 @@ def _build_client():
         return None
 
 
+def _fetch_provider_key(
+    client, table: str, provider_id: str
+) -> Optional[str]:
+    """Fetch a single provider's API key from DynamoDB.
+
+    Returns the string value, or None if the row is absent, the value
+    attribute is missing/empty, or any AWS error occurs. Never raises.
+    """
+    try:
+        response = client.get_item(
+            TableName=table,
+            Key={"key": {"S": provider_id}},
+        )
+    except Exception as exc:
+        logger.warning(
+            "dynamodb_key_loader: GetItem failed for provider=%s: %s",
+            provider_id,
+            type(exc).__name__,
+        )
+        return None
+
+    item = response.get("Item")
+    if not item:
+        logger.debug(
+            "dynamodb_key_loader: no row for provider=%s", provider_id
+        )
+        return None
+
+    value_attr = item.get("value") or {}
+    value = value_attr.get("S") or ""
+    if not value:
+        logger.debug(
+            "dynamodb_key_loader: empty value for provider=%s", provider_id
+        )
+        return None
+
+    return value
+
+
 def _provider_targets() -> Iterable[Tuple[str, str]]:
     """Yield (provider_id, primary_env_var) for every provider whose key
     we want to source from DynamoDB.
