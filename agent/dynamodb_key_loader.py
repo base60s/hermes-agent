@@ -29,7 +29,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,16 @@ _EXTRA_TARGETS: Tuple[Tuple[str, str, str], ...] = (
 )
 
 _applied = False
+
+# Probe budget per provider. The harvested-key pool has high failure
+# rates (flagged-as-leaked, expired, daily quota burned) so we want to
+# find multiple working keys per provider to populate
+# ``fallback_providers`` for runtime rotation, but we also want to cap
+# startup time. _MAX_KEYS_PROBED_PER_PROVIDER bounds HTTP calls per
+# provider; _MAX_WORKING_KEYS_PER_PROVIDER bounds how many verified
+# entries we accept before moving on.
+_MAX_KEYS_PROBED_PER_PROVIDER = 20
+_MAX_WORKING_KEYS_PER_PROVIDER = 5
 
 
 # Provider probe priority. The loader walks this list in order, calls
@@ -351,37 +361,77 @@ def _provider_table_name_for(hermes_id: str) -> str:
     return _TABLE_PROVIDER_NAMES.get(hermes_id, hermes_id)
 
 
-def _select_provider_and_key(
+def _build_fallback_chain(
     keys_by_provider: Dict[str, List[str]]
-) -> Optional[Tuple[_ProviderProbe, str, str]]:
-    """Walk the probe list in priority order. For each provider, try
-    every available key × every preferred model until one (key, model)
-    returns 2xx. Returns ``(probe, model, working_key)`` or None.
+) -> List[Dict[str, Any]]:
+    """Walk the probe list in priority order, find up to
+    ``_MAX_WORKING_KEYS_PER_PROVIDER`` working (provider, key, model)
+    combinations per provider (capped at
+    ``_MAX_KEYS_PROBED_PER_PROVIDER`` HTTP probes), and return them as
+    fallback-chain entries ready to be dropped into config.yaml under
+    ``fallback_providers``.
 
-    Trying every key per provider matters because pool keys are
-    frequently flagged, expired, or quota-burned even when their
-    DynamoDB ``validation_status`` is still ``"valid"`` (validation is
-    set at first-seen time and decays). Only when every key for a
-    provider fails do we move to the next provider in the priority
-    chain.
+    Each entry is a dict:
+        {provider, model, base_url?, api_key}
+
+    Hermes's AIAgent.__init__ normalizes this list into ``_fallback_chain``
+    and ``_try_activate_fallback`` advances through it whenever the active
+    credential returns a non-retryable 4xx, giving us free runtime key
+    rotation across both keys-within-a-provider and across providers.
+
+    The returned list preserves priority: best provider's working keys
+    first (for primary + early fallbacks), then next provider's, etc.
     """
+    chain: List[Dict[str, Any]] = []
     for probe in _PROBES:
         candidates = keys_by_provider.get(_provider_table_name_for(probe.id))
         if not candidates:
             continue
+        probed = 0
+        found = 0
         for key in candidates:
+            if probed >= _MAX_KEYS_PROBED_PER_PROVIDER:
+                break
+            if found >= _MAX_WORKING_KEYS_PER_PROVIDER:
+                break
+            chosen_model: Optional[str] = None
             for model in probe.preferred_models:
+                probed += 1
                 if _probe_completion_with_key(probe, model, key):
-                    return probe, model, key
-    return None
+                    chosen_model = model
+                    break
+                if probed >= _MAX_KEYS_PROBED_PER_PROVIDER:
+                    break
+            if chosen_model is None:
+                continue
+            entry: Dict[str, Any] = {
+                "provider": probe.hermes_provider,
+                "model": chosen_model,
+                "api_key": key,
+            }
+            if probe.base_url:
+                entry["base_url"] = probe.base_url
+            chain.append(entry)
+            found += 1
+    return chain
 
 
-def _write_config_overrides(probe: _ProviderProbe, model: str) -> None:
-    """Patch ``model.default`` / ``model.provider`` / ``model.base_url``
-    in ``$HERMES_HOME/config.yaml`` so the gateway's
-    ``_resolve_gateway_model`` picks up the probed selection. Skips
-    silently when the file is missing or PyYAML is unavailable.
+def _write_config_overrides(chain: List[Dict[str, Any]]) -> None:
+    """Patch ``$HERMES_HOME/config.yaml`` so the gateway picks up:
+
+      * ``model.default`` / ``model.provider`` / ``model.base_url`` /
+        ``model.api_key`` — the first verified entry from the chain
+        becomes the primary that the gateway boots on.
+      * ``fallback_providers`` — every other verified entry, in
+        priority order, so AIAgent.__init__ can rotate to it on
+        non-retryable errors.
+
+    Skips silently when the file is missing or PyYAML is unavailable
+    (the loader is best-effort; agent must still boot).
     """
+    if not chain:
+        return
+
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
     path = os.path.join(home, "config.yaml")
     if not os.path.exists(path):
@@ -410,17 +460,29 @@ def _write_config_overrides(probe: _ProviderProbe, model: str) -> None:
         )
         return
 
+    primary = chain[0]
+    fallbacks = chain[1:]
+
     model_section = cfg.get("model")
     if not isinstance(model_section, dict):
         model_section = {}
         cfg["model"] = model_section
 
-    model_section["default"] = model
-    model_section["provider"] = probe.hermes_provider
-    if probe.base_url:
-        model_section["base_url"] = probe.base_url
+    model_section["default"] = primary["model"]
+    model_section["provider"] = primary["provider"]
+    if primary.get("base_url"):
+        model_section["base_url"] = primary["base_url"]
     else:
         model_section.pop("base_url", None)
+    if primary.get("api_key"):
+        model_section["api_key"] = primary["api_key"]
+    else:
+        model_section.pop("api_key", None)
+
+    if fallbacks:
+        cfg["fallback_providers"] = fallbacks
+    else:
+        cfg.pop("fallback_providers", None)
 
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -434,11 +496,9 @@ def _write_config_overrides(probe: _ProviderProbe, model: str) -> None:
         return
 
     msg = (
-        f"dynamodb_key_loader: probed and selected "
-        f"{probe.hermes_provider}/{model}"
+        f"dynamodb_key_loader: primary={primary['provider']}/{primary['model']} "
+        f"+ {len(fallbacks)} fallback entries (probed pool keys)"
     )
-    if probe.base_url:
-        msg += f" base_url={probe.base_url}"
     logger.info(msg)
     print(msg, file=sys.stderr, flush=True)
 
@@ -488,23 +548,36 @@ def apply_dynamodb_overrides() -> None:
     # before any logging handler is configured.
     print(summary, file=sys.stderr, flush=True)
 
-    # Dynamic provider selection. Walk _PROBES in priority order; for
-    # each provider, try every available key × every preferred model
-    # until one (key, model) returns 2xx on a real 1-token completion.
-    # The working key replaces whatever the loader wrote earlier into
-    # the provider's env var (so the bot uses the verified key, not
-    # just any 'valid' one), and the model is patched into config.yaml.
+    # Dynamic provider selection + fallback chain. For each provider in
+    # priority order, probe up to _MAX_KEYS_PROBED_PER_PROVIDER keys
+    # × each preferred model with a 1-token completion, accumulating
+    # up to _MAX_WORKING_KEYS_PER_PROVIDER verified entries. The first
+    # entry becomes the primary (model.default/provider/base_url/api_key),
+    # the rest become config.yaml's `fallback_providers`. Hermes's
+    # existing _try_activate_fallback rotates through the chain on every
+    # non-retryable 4xx, giving us runtime key rotation across both keys
+    # within a provider and across providers when one is exhausted.
     # Skipped when HERMES_MODEL_OVERRIDE pins a choice, or
     # HERMES_PROBE_DISABLED is truthy.
     if (
         not _is_truthy(os.environ.get("HERMES_PROBE_DISABLED"))
         and not os.environ.get("HERMES_MODEL_OVERRIDE")
     ):
-        selection = _select_provider_and_key(keys_by_provider)
-        if selection is not None:
-            probe, model, working_key = selection
-            os.environ[probe.env_var] = working_key
-            _write_config_overrides(probe, model)
+        chain = _build_fallback_chain(keys_by_provider)
+        if chain:
+            primary = chain[0]
+            # Mirror the primary's key into the env var so any code path
+            # that still reads OPENAI_API_KEY / ANTHROPIC_API_KEY etc.
+            # (rather than the per-fallback explicit api_key) sees the
+            # verified-working credential.
+            for probe in _PROBES:
+                if (
+                    probe.hermes_provider == primary["provider"]
+                    and probe.base_url == primary.get("base_url")
+                ):
+                    os.environ[probe.env_var] = primary["api_key"]
+                    break
+            _write_config_overrides(chain)
         else:
             no_provider_msg = (
                 "dynamodb_key_loader: no (provider, key, model) combination "
