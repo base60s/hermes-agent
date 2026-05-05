@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Iterable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -188,10 +189,13 @@ def apply_dynamodb_overrides() -> None:
         os.environ[primary_env_var] = value
         applied_count += 1
 
-    logger.info(
-        "dynamodb_key_loader: applied %d/%d provider keys from %s",
-        applied_count,
-        total_count,
-        table,
+    summary = (
+        f"dynamodb_key_loader: applied {applied_count}/{total_count} "
+        f"provider keys from {table}"
     )
+    logger.info(summary)
+    # Also print to stderr so the summary is visible during early startup
+    # before any logging handler is configured (e.g. gateway/run.py main()
+    # calls us before its own logging.basicConfig).
+    print(summary, file=sys.stderr, flush=True)
     _applied = True
