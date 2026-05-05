@@ -9,7 +9,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer = "2026-04-28T16:22:14.151617Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -1958,6 +1958,7 @@ version = "0.12.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "boto3" },
     { name = "croniter" },
     { name = "edge-tts" },
     { name = "exa-py" },
@@ -2144,6 +2145,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.39.0,<1" },
     { name = "asyncpg", marker = "extra == 'matrix'", specifier = ">=0.29" },
     { name = "atroposlib", marker = "extra == 'rl'", git = "https://github.com/NousResearch/atropos.git?rev=c20c85256e5a45ad31edf8b7276e9c5ee1995a30" },
+    { name = "boto3", specifier = ">=1.35.0,<2" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.35.0,<2" },
     { name = "croniter", specifier = ">=6.0.0,<7" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = ">=0.148.0,<1" },
