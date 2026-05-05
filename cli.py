@@ -11812,6 +11812,9 @@ def main(
     """
     global _active_worktree
 
+    from agent.dynamodb_key_loader import apply_dynamodb_overrides
+    apply_dynamodb_overrides()
+
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
     os.environ["HERMES_INTERACTIVE"] = "1"
