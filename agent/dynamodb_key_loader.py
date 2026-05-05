@@ -26,6 +26,15 @@ DEFAULT_TABLE = "chroma-llm-keys"
 DEFAULT_REGION = "us-east-1"
 _TRUTHY = {"1", "true", "yes", "on"}
 
+# Providers that Hermes treats specially and so are not present in
+# hermes_cli.auth.PROVIDER_REGISTRY but still need to be sourced from
+# DynamoDB. OpenRouter is the default routing layer (see
+# agent/auxiliary_client.py:_try_openrouter) and is the primary key the
+# Hermeregildo Telegram bot needs.
+_EXTRA_TARGETS: Tuple[Tuple[str, str], ...] = (
+    ("openrouter", "OPENROUTER_API_KEY"),
+)
+
 _applied = False
 
 
@@ -70,6 +79,49 @@ def _build_client():
         return None
 
 
+def _provider_targets() -> Iterable[Tuple[str, str]]:
+    """Yield (provider_id, primary_env_var) for every provider whose key
+    we want to source from DynamoDB.
+
+    Sources, in order: ``_EXTRA_TARGETS`` (special providers Hermes does
+    not register, e.g. OpenRouter) followed by every provider in
+    ``hermes_cli.auth.PROVIDER_REGISTRY`` that has at least one
+    ``api_key_env_var`` configured. Provider ids are lowercased to match
+    the DynamoDB key convention. Duplicates are filtered so each
+    provider id is yielded at most once.
+    """
+    seen: set[str] = set()
+
+    for provider_id, primary in _EXTRA_TARGETS:
+        pid = provider_id.lower()
+        if pid in seen or not primary:
+            continue
+        seen.add(pid)
+        yield pid, primary
+
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+    except Exception as exc:
+        logger.warning(
+            "dynamodb_key_loader: cannot import PROVIDER_REGISTRY: %s",
+            type(exc).__name__,
+        )
+        return
+
+    for provider_id, pconfig in PROVIDER_REGISTRY.items():
+        env_vars = getattr(pconfig, "api_key_env_vars", ()) or ()
+        if not env_vars:
+            continue
+        primary = env_vars[0]
+        if not primary:
+            continue
+        pid = provider_id.lower()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        yield pid, primary
+
+
 def apply_dynamodb_overrides() -> None:
     """Read provider API keys from DynamoDB and write them into os.environ.
 
@@ -85,5 +137,5 @@ def apply_dynamodb_overrides() -> None:
         _applied = True
         return
 
-    # Provider iteration and per-provider GetItem are added in later tasks.
+    # Per-provider GetItem and write-into-os.environ wired up in Task 7.
     _applied = True

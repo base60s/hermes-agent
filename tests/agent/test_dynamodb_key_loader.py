@@ -116,3 +116,24 @@ def test_boto3_import_error_returns_without_raising(_no_aws_env, monkeypatch, ca
 
     assert any("boto3 not installed" in r.message for r in caplog.records)
     assert dynamodb_key_loader._applied is True
+
+
+def test_provider_targets_yields_id_and_primary_env_var():
+    """_provider_targets yields (provider_id, primary_env_var) for providers
+    that have at least one api_key_env_var, lowercasing the provider id."""
+    from agent import dynamodb_key_loader
+
+    targets = dict(dynamodb_key_loader._provider_targets())
+
+    # OpenRouter must be present and map to OPENROUTER_API_KEY.
+    assert "openrouter" in targets
+    assert targets["openrouter"] == "OPENROUTER_API_KEY"
+
+    # Anthropic must be present and pick the *first* env var alias.
+    assert "anthropic" in targets
+    assert targets["anthropic"] == "ANTHROPIC_API_KEY"
+
+    # All keys are lowercase, all values are non-empty strings.
+    for provider_id, env_var in targets.items():
+        assert provider_id == provider_id.lower(), provider_id
+        assert env_var and isinstance(env_var, str), (provider_id, env_var)
